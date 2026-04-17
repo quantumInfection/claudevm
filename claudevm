@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""claudevm — Manage multiple Anthropic Claude API keys"""
+
+import os, sys, json, stat, re, shlex, subprocess
+from pathlib import Path
+from difflib import get_close_matches
+
+# ── Color support ─────────────────────────────────────────────────────────────
+_COLOR = (sys.stdout.isatty() or sys.stderr.isatty()) and not os.environ.get('NO_COLOR')
+
+G = '\033[92m'; R = '\033[91m'; Y = '\033[93m'; C = '\033[96m'
+B = '\033[1m';  D = '\033[2m';  X = '\033[0m'
+
+def _c(*parts) -> str:
+    """Join color+text parts, auto-appending reset. Strips codes if no-color."""
+    if not _COLOR:
+        return ''.join(str(p) for p in parts if not str(p).startswith('\033'))
+    result = ''.join(str(p) for p in parts)
+    if any(str(p).startswith('\033') for p in parts):
+        result += X
+    return result
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+DIR   = Path.home() / '.claudevm'
+STORE = DIR / 'accounts.json'
+
+def load() -> dict:
+    if not STORE.exists():
+        return {}
+    try:
+        return json.loads(STORE.read_text())
+    except Exception:
+        return {}
+
+def save(accounts: dict):
+    DIR.mkdir(mode=0o700, exist_ok=True)
+    tmp = STORE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(accounts, indent=2) + '\n')
+    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)   # 600
+    tmp.replace(STORE)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def mask(key: str) -> str:
+    return (key[:10] + '****' + key[-4:]) if len(key) >= 14 else '****'
+
+def cur() -> str:
+    return os.environ.get('CLAUDEVM_CURRENT', '')
+
+def die(msg: str, code: int = 1):
+    print(_c(R, 'error: ') + msg, file=sys.stderr)
+    sys.exit(code)
+
+def ok(msg: str):
+    print(_c(G, '✓ ') + msg)
+
+def validate_name(name: str):
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', name):
+        die(f"invalid name '{name}' — use letters, numbers, hyphens, underscores")
+
+def suggest(name: str, choices) -> str:
+    m = get_close_matches(name, choices, n=2, cutoff=0.5)
+    return ('  (did you mean: ' + ', '.join(m) + '?)') if m else ''
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_add(argv):
+    force = '--force' in argv or '-f' in argv
+    argv  = [a for a in argv if a not in ('--force', '-f')]
+    if len(argv) < 2:
+        die("usage: claudevm add <name> <api_key>")
+    name, key = argv[0], argv[1].strip()
+    validate_name(name)
+    if len(key) < 20:
+        die("API key looks invalid — must be at least 20 characters")
+    accounts = load()
+    if name in accounts and not force:
+        die(f"'{name}' already exists — use --force to overwrite")
+    accounts[name] = key
+    save(accounts)
+    ok(f"account {_c(B, name)} added")
+
+
+def cmd_list(argv):
+    accounts = load()
+    active   = cur()
+    if not accounts:
+        print(_c(D, 'no accounts — run: claudevm add <name> <api_key>'))
+        return
+    pad = max(len(n) for n in accounts) + 2
+    print()
+    for name, key in accounts.items():
+        m      = mask(key)
+        spaces = ' ' * (pad - len(name))   # visual-width padding, unaffected by ANSI
+        if name == active:
+            marker = _c(G, B, '▶')
+            label  = _c(G, B, name)
+            tag    = '  ' + _c(G, '(active)')
+        else:
+            marker = ' '
+            label  = name
+            tag    = ''
+        print(f"  {marker} {label}{spaces}  {_c(D, m)}{tag}")
+    print()
+
+
+def cmd_current(argv):
+    active = cur()
+    if active:
+        print(_c(G, B, active))
+    else:
+        print(_c(Y, 'no active account') + ' — run: claudevm use <name>')
+
+
+def cmd_remove(argv):
+    force = '--force' in argv or '-f' in argv
+    argv  = [a for a in argv if a not in ('--force', '-f')]
+    if not argv:
+        die("usage: claudevm remove <name>")
+    name     = argv[0]
+    accounts = load()
+    if name not in accounts:
+        die(f"account '{name}' not found" + suggest(name, accounts))
+    if not force:
+        try:
+            ans = input(f"Remove account '{_c(B, name)}'? {_c(D, '[y/N]')} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(); sys.exit(0)
+        if ans not in ('y', 'yes'):
+            print('aborted'); return
+    del accounts[name]
+    save(accounts)
+    ok(f"account '{name}' removed")
+
+
+def cmd_rename(argv):
+    if len(argv) < 2:
+        die("usage: claudevm rename <old> <new>")
+    old, new = argv[0], argv[1]
+    validate_name(new)
+    accounts = load()
+    if old not in accounts:
+        die(f"account '{old}' not found" + suggest(old, accounts))
+    if new in accounts:
+        die(f"account '{new}' already exists")
+    # Rebuild dict preserving insertion order
+    accounts = {(new if k == old else k): v for k, v in accounts.items()}
+    save(accounts)
+    ok(f"renamed '{old}' → '{new}'")
+
+
+def cmd_exec(argv):
+    if not argv:
+        die("usage: claudevm exec <name> -- <command>")
+    name = argv[0]
+    try:
+        sep = argv.index('--')
+        cmd = argv[sep + 1:]
+    except ValueError:
+        cmd = argv[1:]
+    if not cmd:
+        die("no command specified — use: claudevm exec <name> -- <command>")
+    accounts = load()
+    if name not in accounts:
+        die(f"account '{name}' not found" + suggest(name, accounts))
+    env = {**os.environ, 'ANTHROPIC_API_KEY': accounts[name], 'CLAUDEVM_CURRENT': name}
+    try:
+        sys.exit(subprocess.run(cmd, env=env).returncode)
+    except FileNotFoundError:
+        die(f"command not found: {cmd[0]}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def cmd_use(argv):
+    """
+    Without --shell: explains that shell integration is needed.
+    With --shell   : outputs eval-able export commands (consumed by the shell wrapper).
+    """
+    is_shell = '--shell' in argv
+    argv     = [a for a in argv if a != '--shell']
+    name     = argv[0] if argv else ''
+
+    if not is_shell:
+        n = f' {name}' if name else ''
+        print(
+            _c(Y, 'Shell integration required.') + '\n\n'
+            'Add to ~/.zshrc or ~/.bashrc:\n'
+            '  eval "$(claudevm init)"\n\n'
+            'Then reload your shell and run:\n'
+            f'  claudevm use{n}\n\n'
+            'Or run once without reloading:\n'
+            f'  eval "$(claudevm use{n} --shell)"'
+        )
+        return
+
+    accounts = load()
+
+    if not name:
+        name = interactive_pick(accounts)
+        if not name:
+            sys.exit(0)
+
+    if name not in accounts:
+        # Fuzzy fallback: accept if exactly one close match
+        matches = get_close_matches(name, accounts.keys(), n=1, cutoff=0.75)
+        if matches:
+            name = matches[0]
+        else:
+            print(f"echo 'claudevm: account \"{name}\" not found'", file=sys.stderr)
+            sys.exit(1)
+
+    key = accounts[name]
+    # stdout is captured by $() and passed to eval
+    sys.stdout.write(f"export ANTHROPIC_API_KEY={shlex.quote(key)}\n")
+    sys.stdout.write(f"export CLAUDEVM_CURRENT={shlex.quote(name)}\n")
+    # stderr is visible in the terminal, never eval'd
+    print(_c(G, '✓ ') + f"switched to {_c(G, B, name)}", file=sys.stderr)
+
+
+def cmd_logout(argv):
+    is_shell = '--shell' in argv
+    if not is_shell:
+        print(
+            _c(Y, 'Shell integration required.') + '\n\n'
+            'Add to ~/.zshrc or ~/.bashrc:\n'
+            '  eval "$(claudevm init)"\n\n'
+            'Then: claudevm logout'
+        )
+        return
+    sys.stdout.write("unset ANTHROPIC_API_KEY\n")
+    sys.stdout.write("unset CLAUDEVM_CURRENT\n")
+    print(_c(G, '✓ ') + "logged out", file=sys.stderr)
+
+
+# ── Interactive picker ────────────────────────────────────────────────────────
+
+def interactive_pick(accounts: dict) -> str:
+    """Arrow-key account selector, drawn on stderr. Returns selected name or ''."""
+    if not accounts:
+        print(_c(Y, 'no accounts saved'), file=sys.stderr)
+        return ''
+    if not sys.stdin.isatty():
+        die("stdin is not a tty — provide a name: claudevm use <name>")
+
+    import tty, termios
+
+    names  = list(accounts.keys())
+    active = cur()
+    idx    = [names.index(active) if active in names else 0]
+    pad    = max(len(n) for n in names)
+    drawn  = [0]
+    err    = sys.stderr
+
+    def render():
+        if drawn[0]:
+            err.write(f'\033[{drawn[0]}A\r')
+        err.write(f'\033[K{_c(B, "  Select account")}  {_c(D, "↑↓ navigate · enter select · q quit")}\n')
+        for i, n in enumerate(names):
+            m      = mask(accounts[n])
+            spaces = ' ' * (pad - len(n))
+            if i == idx[0]:
+                err.write(f'\033[K  {_c(G, B, "▶ " + n)}{spaces}  {_c(D, m)}\n')
+            else:
+                err.write(f'\033[K    {n}{spaces}  {_c(D, m)}\n')
+        err.flush()
+        drawn[0] = len(names) + 1
+
+    chosen = ['']
+    fd  = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        render()
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                seq = sys.stdin.read(2)
+                if   seq == '[A': idx[0] = (idx[0] - 1) % len(names)
+                elif seq == '[B': idx[0] = (idx[0] + 1) % len(names)
+                render()
+            elif ch in ('\r', '\n'):
+                chosen[0] = names[idx[0]]; break
+            elif ch in ('\x03', '\x04', 'q'):
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        err.write('\n'); err.flush()
+
+    return chosen[0]
+
+
+# ── Shell integration snippet ─────────────────────────────────────────────────
+
+SHELL_INIT = '''\
+# claudevm shell integration
+claudevm() {
+    case "$1" in
+        use|logout)
+            # Capture stdout (the export commands) and eval them in this shell.
+            # Stderr (status messages) flows through to the terminal unchanged.
+            eval "$(command claudevm "$@" --shell)"
+            ;;
+        *)
+            command claudevm "$@"
+            ;;
+    esac
+}
+'''
+
+def cmd_init(argv):
+    print(SHELL_INIT, end='')
+
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+def cmd_help(argv):
+    print(f"""\
+{_c(B, 'claudevm')} — Manage multiple Anthropic Claude API keys
+
+{_c(B, 'Usage:')}
+  claudevm add <name> <key>        Add an account              {_c(D, '[--force]')}
+  claudevm use [name]              Switch active account       {_c(D, '(interactive if no name)')}
+  claudevm list                    List all accounts
+  claudevm current                 Show active account
+  claudevm remove <name>           Remove an account           {_c(D, '[--force]')}
+  claudevm rename <old> <new>      Rename an account
+  claudevm exec <name> -- <cmd>    Run command with specific account
+  claudevm logout                  Clear active account
+  claudevm init                    Print shell integration code
+
+{_c(B, 'Shell setup (one-time):')}
+  echo 'eval "$(claudevm init)"' >> ~/.zshrc   # or ~/.bashrc
+  source ~/.zshrc
+
+{_c(B, 'Examples:')}
+  claudevm add work sk-ant-api03-...
+  claudevm use work
+  claudevm exec personal -- claude "summarize this repo"
+  claudevm list
+  claudevm rename work company
+""")
+
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+DISPATCH = {
+    'add':     cmd_add,
+    'list':    cmd_list,    'ls':      cmd_list,
+    'current': cmd_current,
+    'remove':  cmd_remove,  'rm':      cmd_remove,    'delete': cmd_remove,
+    'rename':  cmd_rename,  'mv':      cmd_rename,
+    'exec':    cmd_exec,    'run':     cmd_exec,
+    'use':     cmd_use,     'switch':  cmd_use,
+    'logout':  cmd_logout,
+    'init':    cmd_init,
+    'help':    cmd_help,
+}
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ('-h', '--help'):
+        cmd_help([]); return
+    cmd, rest = args[0], args[1:]
+    if cmd not in DISPATCH:
+        die(f"unknown command '{cmd}' — run: claudevm help")
+    DISPATCH[cmd](rest)
+
+if __name__ == '__main__':
+    main()
